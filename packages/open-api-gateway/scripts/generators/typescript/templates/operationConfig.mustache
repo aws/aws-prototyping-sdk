@@ -3,10 +3,8 @@
 import {
     {{#imports}}
     {{className}},
-    {{^withoutRuntimeChecks}}
     {{className}}FromJSON,
     {{className}}ToJSON,
-    {{/withoutRuntimeChecks}}
     {{/imports}}
 } from '../../models';
 {{/imports.0}}
@@ -63,7 +61,7 @@ const decodeRequestParameters = (parameters: ApiGatewayRequestParameters): ApiGa
 /**
  * Parse the body if the content type is json, otherwise leave as a raw string
  */
-const parseBody = (body: string, contentTypes: string[]): any => contentTypes.filter((contentType) => contentType !== 'application/json').length === 0 ? JSON.parse(body || '{}') : body;
+const parseBody = (body: string, demarshal: (body: string) => any, contentTypes: string[]): any => contentTypes.filter((contentType) => contentType !== 'application/json').length === 0 ? demarshal(body || '{}') : body;
 
 // Api gateway lambda handler type
 type ApiGatewayLambdaHandler = (event: any, context: any) => Promise<any>;
@@ -82,12 +80,45 @@ export type LambdaRequestParameters<RequestParameters, RequestArrayParameters, R
     body: RequestBody,
 };
 
+/**
+ * A lambda handler function which is part of a chain. It may invoke the remainder of the chain via the given chain input
+ */
+export type ChainedLambdaHandlerFunction<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError> = (
+  input: LambdaRequestParameters<RequestParameters, RequestArrayParameters, RequestBody>,
+  event: any,
+  context: any,
+  chain: LambdaHandlerChain<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError>,
+) => Promise<OperationResponse<RequestOutput, ApiError>>;
+
 // Type for a lambda handler function to be wrapped
 export type LambdaHandlerFunction<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError> = (
-    input: LambdaRequestParameters<RequestParameters, RequestArrayParameters, RequestBody>,
-    event: any,
-    context: any,
+  input: LambdaRequestParameters<RequestParameters, RequestArrayParameters, RequestBody>,
+  event: any,
+  context: any,
 ) => Promise<OperationResponse<RequestOutput, ApiError>>;
+
+export interface LambdaHandlerChain<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError> {
+  next: LambdaHandlerFunction<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError>;
+}
+
+/**
+ * Build a chain from the given array of chained lambda handlers
+ */
+const buildHandlerChain = <RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError>(...handlers: ChainedLambdaHandlerFunction<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError>[]): LambdaHandlerChain<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, ApiError> => {
+  if (handlers.length === 0) {
+    return {
+      next: () => {
+        throw new Error("No more handlers remain in the chain! The last handler should not call next.");
+      }
+    };
+  }
+  const [currentHandler, ...remainingHandlers] = handlers;
+  return {
+    next: (input, event, context) => {
+      return currentHandler(input, event, context, buildHandlerChain(...remainingHandlers));
+    },
+  };
+};
 
 {{#operations}}
 {{#operation}}
@@ -126,12 +157,12 @@ export interface {{operationIdCamelCase}}RequestArrayParameters {
 export type {{operationIdCamelCase}}RequestBody = {{#bodyParam}}{{dataType}}{{/bodyParam}}{{^bodyParam}}never{{/bodyParam}};
 
 // Type that the handler function provided to the wrapper must conform to
-type {{operationIdCamelCase}}HandlerFunction<ApiError> = LambdaHandlerFunction<{{operationIdCamelCase}}RequestParameters, {{operationIdCamelCase}}RequestArrayParameters, {{operationIdCamelCase}}RequestBody, {{returnType}}, ApiError>;
+export type {{operationIdCamelCase}}HandlerFunction<ApiError> = ChainedLambdaHandlerFunction<{{operationIdCamelCase}}RequestParameters, {{operationIdCamelCase}}RequestArrayParameters, {{operationIdCamelCase}}RequestBody, {{returnType}}, ApiError>;
 
 /**
  * Lambda handler wrapper to provide typed interface for the implementation of {{nickname}}
  */
-export const {{nickname}}Handler = <ApiError>(handler: {{operationIdCamelCase}}HandlerFunction<ApiError>): ApiGatewayLambdaHandler => async (event: any, context: any): Promise<any> => {
+export const {{nickname}}Handler = <ApiError>(firstHandler: {{operationIdCamelCase}}HandlerFunction<ApiError>, ...remainingHandlers: {{operationIdCamelCase}}HandlerFunction<ApiError>[]): ApiGatewayLambdaHandler => async (event: any, context: any): Promise<any> => {
     const requestParameters = decodeRequestParameters({
         ...(event.pathParameters || {}),
         ...(event.queryStringParameters || {}),
@@ -141,17 +172,40 @@ export const {{nickname}}Handler = <ApiError>(handler: {{operationIdCamelCase}}H
         ...(event.multiValueQueryStringParameters || {}),
     }) as unknown as {{operationIdCamelCase}}RequestArrayParameters;
 
-    const body = parseBody(event.body, [{{^consumes}}'application/json'{{/consumes}}{{#consumes}}{{#mediaType}}'{{{.}}}',{{/mediaType}}{{/consumes}}]) as {{operationIdCamelCase}}RequestBody;
+    const demarshal = (bodyString: string): any => {
+        let parsed = JSON.parse(bodyString);
+        {{#bodyParam}}
+        parsed = {{dataType}}FromJSON(parsed);
+        {{/bodyParam}}
+        return parsed;
+    };
+    const body = parseBody(event.body, demarshal, [{{^consumes}}'application/json'{{/consumes}}{{#consumes}}{{#mediaType}}'{{{.}}}',{{/mediaType}}{{/consumes}}]) as {{operationIdCamelCase}}RequestBody;
 
-    const response = await handler({
+    const chain = buildHandlerChain(firstHandler, ...remainingHandlers);
+    const response = await chain.next({
         requestParameters,
         requestArrayParameters,
         body,
     }, event, context);
 
+    const marshal = (responseBody: any): string => {
+        let response = responseBody;
+        switch(response.statusCode) {
+        {{#responses}}
+            case {{code}}:
+                response = {{dataType}}ToJSON(response);
+                break;
+        {{/responses}}
+            default:
+                break;
+        }
+
+        return JSON.stringify(response);
+    };
+
     return {
         ...response,
-        body: response.body ? JSON.stringify(response.body) : '',
+        body: response.body ? marshal(response.body) : '',
     };
 };
 {{/operation}}

@@ -1,6 +1,6 @@
 ## OpenAPI Gateway
 
-Define your APIs using [OpenAPI v3](https://swagger.io/specification/), and leverage the power of generated clients, automatic input validation, and type safe client and server code!
+Define your APIs using [OpenAPI v3](https://swagger.io/specification/), and leverage the power of generated clients and documentation, automatic input validation, and type safe client and server code!
 
 This package vends a projen project type which allows you to define an API using [OpenAPI v3](https://swagger.io/specification/), and a construct which manages deploying this API in API Gateway, given a lambda integration for every operation.
 
@@ -19,7 +19,7 @@ For usage in a monorepo:
 Create the project in your .projenrc:
 
 ```ts
-import {ClientLanguage, OpenApiGatewayTsProject} from "@aws-prototyping-sdk/open-api-gateway";
+import { ClientLanguage, DocumentationFormat, OpenApiGatewayTsProject } from "@aws-prototyping-sdk/open-api-gateway";
 
 new OpenApiGatewayTsProject({
   parent: myNxMonorepo,
@@ -27,6 +27,7 @@ new OpenApiGatewayTsProject({
   name: "my-api",
   outdir: "packages/api",
   clientLanguages: [ClientLanguage.TYPESCRIPT, ClientLanguage.PYTHON, ClientLanguage.JAVA],
+  documentationFormats: [DocumentationFormat.HTML2, DocumentationFormat.PLANTUML, DocumentationFormat.MARKDOWN],
 });
 ```
 
@@ -48,6 +49,10 @@ In the output directory (`outdir`), you'll find a few files to get you started.
     |_ typescript/ - A generated typescript API client, including generated lambda handler wrappers
     |_ python/ - A generated python API client.
     |_ java/ - A generated java API client.
+    |_ documentation/
+        |_ html2/ - Generated html documentation
+        |_ markdown/ - Generated markdown documentation
+        |_ plantuml/ - Generated plant uml documentation
 ```
 
 If you would prefer to not generate the sample code, you can pass `sampleCode: false` to `OpenApiGatewayTsProject`.
@@ -431,6 +436,83 @@ def handler(input: SayHelloRequest, **kwargs) -> ApiResponse[HelloResponse, ApiE
         body=HelloResponse(message="Hello {}!".format(input.request_parameters["name"])),
         headers={}
     )
+```
+
+### Interceptors
+
+The lambda handler wrappers allow you to pass in a _chain_ of handler functions to handle the request. This allows you to implement middleware / interceptors for handling requests. Each handler function may choose whether or not to continue the handler chain by invoking `chain.next(input, event, context)`. Note that the last handler in the chain (ie the actual request handler which transforms the input to the output) should not call `chain.next`.
+
+#### Typescript
+
+In typescript, interceptors are passed as separate arguments to the generated handler wrapper, in the order in which they should be executed.
+
+```ts
+import {
+  sayHelloHandler,
+  ApiError,
+  LambdaRequestParameters,
+  LambdaHandlerChain,
+  OperationResponse
+} from "my-api-typescript-client";
+
+// Interceptor to wrap invocations in a try/catch, returning a 500 error for any unhandled exceptions.
+const tryCatchInterceptor = async <
+  RequestParameters,
+  RequestArrayParameters,
+  RequestBody,
+  RequestOutput,
+  TError
+>(
+  input: LambdaRequestParameters<RequestParameters, RequestArrayParameters, RequestBody>,
+  event: any,
+  context: any,
+  chain: LambdaHandlerChain<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, TError>,
+): Promise<OperationResponse<RequestOutput, TError>> => {
+  try {
+    return await chain.next(input, event, context);
+  } catch (e) {
+    return { statusCode: 500, body: { errorMessage: e.message }};
+  }
+};
+
+// tryCatchInterceptor is passed first, so it runs first and calls the second argument function (the request handler) via chain.next
+export const handler = sayHelloHandler<ApiError>(tryCatchInterceptor, async (input) => {
+  return {
+    statusCode: 200,
+    body: {
+      message: `Hello ${input.requestParameters.name}!`,
+    },
+  };
+});
+```
+
+Another example interceptor might be to record request time metrics. The example below includes the full generic type signature for an interceptor:
+
+```ts
+import {
+  LambdaRequestParameters,
+  LambdaHandlerChain,
+  OperationResponse,
+} from 'my-api-typescript-client';
+
+const timingInterceptor = async <
+  RequestParameters,
+  RequestArrayParameters,
+  RequestBody,
+  RequestOutput,
+  TError
+>(
+  input: LambdaRequestParameters<RequestParameters, RequestArrayParameters, RequestBody>,
+  event: any,
+  context: any,
+  chain: LambdaHandlerChain<RequestParameters, RequestArrayParameters, RequestBody, RequestOutput, TError>,
+): Promise<OperationResponse<RequestOutput, TError>> => {
+  const start = Date.now();
+  const response = await chain.next(input, event, context);
+  const end = Date.now();
+  console.log(`Took ${end - start}ms`);
+  return response;
+};
 ```
 
 ### Other Details
